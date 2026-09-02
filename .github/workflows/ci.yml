@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # albs is developed on macOS and expected to run on Linux, so both are
+        # exercised: the toolchain preflight, path handling and checkout
+        # collision behaviour all differ between them.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tracks the go directive in go.mod, so the toolchain can never drift
+      # from what the module actually declares.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The preflight must work under a plain POSIX shell, not just bash.
+      - name: Toolchain preflight
+        run: |
+          sh -n scripts/preflight-go.sh
+          sh scripts/preflight-go.sh
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: go test -race ./...

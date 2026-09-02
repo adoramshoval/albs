@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 140" width="440" height="140" role="img" aria-labelledby="albsTitle albsDesc">
+  <title id="albsTitle">albs</title>
+  <desc id="albsDesc">A flat cartoon alpine banner: a pale blue sky with a yellow sun above two layers of blue mountains with white snow caps.</desc>
+  <rect x="0" y="0" width="440" height="140" rx="12" fill="#d6ecf7"/>
+  <circle cx="345" cy="40" r="20" fill="#f6c344"/>
+  <polygon points="0,140 100,52 200,140" fill="#9dbdd0"/>
+  <polygon points="160,140 260,40 360,140" fill="#9dbdd0"/>
+  <polygon points="300,140 400,70 440,112 440,140" fill="#9dbdd0"/>
+  <polygon points="0,140 120,66 240,140" fill="#46647c"/>
+  <polygon points="190,140 320,86 440,140" fill="#46647c"/>
+  <polygon points="120,66 156,88 143,82 132,90 120,83 108,90 97,83 84,88" fill="#ffffff"/>
+  <polygon points="320,86 356,102 344,96 332,104 320,97 308,104 296,97 282,102" fill="#ffffff"/>
+</svg>

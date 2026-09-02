@@ -1,0 +1,4 @@
+# Build artifacts and local caches (see `make clean`)
+bin/
+.cache/
+*.cnb
