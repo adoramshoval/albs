@@ -28,7 +28,7 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "albs",
-	Short: "Package Cloud Native meta-buildpacks into offline .cnb bundles",
+	Short: "Package Paketo meta-buildpacks into offline .cnb bundles",
 	Long: "albs resolves a meta-buildpack's component buildpacks back to their source\n" +
 		"repositories, vendors each one offline with jam, and assembles the result\n" +
 		"into a single composite .cnb package.\n\n" +
