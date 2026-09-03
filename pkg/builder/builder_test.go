@@ -1,16 +1,23 @@
 package builder
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/adoramshoval/albs/pkg/multiarch"
 	"github.com/adoramshoval/albs/pkg/testsupport"
 	"github.com/buildpacks/pack/pkg/client"
+	"github.com/buildpacks/pack/pkg/dist"
 )
 
 const metaPackageTOML = `[buildpack]
@@ -113,7 +120,107 @@ func (f *fakeJam) PackOffline(_ context.Context, srcDir, version, outputTgzPath 
 	if f.err != nil {
 		return f.err
 	}
-	return os.WriteFile(outputTgzPath, []byte("tgz:"+version), 0o644)
+	return writeMultiArchArchive(outputTgzPath, version)
+}
+
+// writeMultiArchArchive mirrors what jam pack emits for a component buildpack:
+// no bin/ at the root, one bin/ per platform, and detect as a same-directory
+// symlink to run.
+func writeMultiArchArchive(path, version string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	body := "tgz:" + version
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "buildpack.toml", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
+	}); err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(body)); err != nil {
+		return err
+	}
+
+	for _, platform := range []string{"linux/amd64", "linux/arm64"} {
+		run := "ELF " + platform + " " + version
+		if err := tw.WriteHeader(&tar.Header{
+			Name: platform + "/bin/", Typeflag: tar.TypeDir, Mode: 0o755,
+		}); err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name: platform + "/bin/run", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(run)),
+		}); err != nil {
+			return err
+		}
+		if _, err := tw.Write([]byte(run)); err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name: platform + "/bin/detect", Typeflag: tar.TypeSymlink, Linkname: "run", Mode: 0o755,
+		}); err != nil {
+			return err
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gw.Close()
+}
+
+// archiveEntries lists an archive's members, and the body of each regular file.
+func archiveEntries(t *testing.T, path string) map[string]string {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip %s: %v", path, err)
+	}
+	defer gr.Close()
+
+	out := map[string]string{}
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		name := strings.TrimSuffix(hdr.Name, "/")
+		if hdr.Typeflag == tar.TypeSymlink {
+			out[name] = "-> " + hdr.Linkname
+			continue
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read %s from %s: %v", name, path, err)
+		}
+		out[name] = string(body)
+	}
+	return out
+}
+
+func sortedNames(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type fakePack struct {
@@ -123,7 +230,7 @@ type fakePack struct {
 	// BuildOffline removes its workspace on return, so anything the tests need
 	// to assert about it has to be captured while the call is in flight.
 	packageTOML  string
-	vendoredDeps map[string]string
+	vendoredDeps map[string]map[string]string
 }
 
 func (f *fakePack) PackageBuildpack(_ context.Context, opts client.PackageBuildpackOptions) error {
@@ -132,28 +239,65 @@ func (f *fakePack) PackageBuildpack(_ context.Context, opts client.PackageBuildp
 	if data, err := os.ReadFile(filepath.Join(opts.RelativeBaseDir, "package.toml")); err == nil {
 		f.packageTOML = string(data)
 	}
-	f.vendoredDeps = map[string]string{}
+	f.vendoredDeps = map[string]map[string]string{}
 	entries, err := os.ReadDir(filepath.Join(opts.RelativeBaseDir, "deps"))
 	if err == nil {
 		for _, e := range entries {
-			data, err := os.ReadFile(filepath.Join(opts.RelativeBaseDir, "deps", e.Name()))
-			if err == nil {
-				f.vendoredDeps[e.Name()] = string(data)
-			}
+			f.vendoredDeps[e.Name()] = f.readDep(filepath.Join(opts.RelativeBaseDir, "deps", e.Name()))
 		}
 	}
 	return f.err
 }
 
+// readDep is deliberately lenient: PackageBuildpack is also called in tests
+// where the archives never got written.
+func (f *fakePack) readDep(path string) map[string]string {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	gr, err := gzip.NewReader(file)
+	if err != nil {
+		return nil
+	}
+	defer gr.Close()
+
+	out := map[string]string{}
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		name := strings.TrimSuffix(hdr.Name, "/")
+		if hdr.Typeflag == tar.TypeSymlink {
+			out[name] = "-> " + hdr.Linkname
+			continue
+		}
+		body, _ := io.ReadAll(tr)
+		out[name] = string(body)
+	}
+	return out
+}
+
 type fakeCache struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// dir stands in for the cache directory on disk. Entries have to be copied
+	// into it, as DiskCache does, because what gets cached lives in a component
+	// workspace that BuildOffline deletes before returning.
+	dir     string
 	entries map[string]string
 	gets    []string
 	puts    []string
 	putErr  error
 }
 
-func newFakeCache() *fakeCache { return &fakeCache{entries: map[string]string{}} }
+func newFakeCache(t *testing.T) *fakeCache {
+	t.Helper()
+	return &fakeCache{dir: t.TempDir(), entries: map[string]string{}}
+}
 
 func (f *fakeCache) Get(key string) (string, bool) {
 	f.mu.Lock()
@@ -170,7 +314,16 @@ func (f *fakeCache) Put(key, srcFilePath string) error {
 	if f.putErr != nil {
 		return f.putErr
 	}
-	f.entries[key] = srcFilePath
+
+	data, err := os.ReadFile(srcFilePath)
+	if err != nil {
+		return err
+	}
+	dest := filepath.Join(f.dir, fmt.Sprintf("entry-%d.tgz", len(f.entries)))
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return err
+	}
+	f.entries[key] = dest
 	return nil
 }
 
@@ -188,9 +341,10 @@ func newHarness(t *testing.T) *harness {
 		cloner: &fakeCloner{packageTOML: metaPackageTOML},
 		jam:    &fakeJam{},
 		pack:   &fakePack{},
-		cache:  newFakeCache(),
+		cache:  newFakeCache(t),
 	}
-	h.b = NewBuilder(h.cloner, fakeResolver{}, h.jam, h.pack, h.cache, testsupport.Logger{}, 2)
+	h.b = NewBuilder(h.cloner, fakeResolver{}, h.jam, h.pack, h.cache, testsupport.Logger{}, 2,
+		multiarch.Target{OS: "linux", Arch: "amd64"})
 	return h
 }
 
@@ -249,6 +403,70 @@ func TestBuildOfflinePassesPackTheCloneRoot(t *testing.T) {
 	if _, ok := h.pack.vendoredDeps["dep-0.tgz"]; !ok {
 		t.Errorf("RelativeBaseDir %q did not contain the vendored deps; saw %v",
 			h.pack.opts.RelativeBaseDir, h.pack.vendoredDeps)
+	}
+}
+
+// The failure this guards against is silent at packaging time: an unflattened
+// component produces a .cnb whose every buildpack fails the lifecycle's detect
+// phase with "fork/exec .../bin/detect: no such file or directory".
+func TestBuildOfflineFlattensDependenciesForTheTarget(t *testing.T) {
+	h := newHarness(t)
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://example.com/meta", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	for _, dep := range []string{"dep-0.tgz", "dep-1.tgz"} {
+		entries := h.pack.vendoredDeps[dep]
+		if got := entries["bin/detect"]; got != "-> run" {
+			t.Errorf("%s bin/detect = %q, want a symlink to run; archive holds %v",
+				dep, got, sortedNames(entries))
+		}
+		if !strings.HasPrefix(entries["bin/run"], "ELF linux/amd64") {
+			t.Errorf("%s bin/run = %q, want the amd64 binary", dep, entries["bin/run"])
+		}
+		for name := range entries {
+			if strings.HasPrefix(name, "linux/") {
+				t.Errorf("%s still holds the unflattened %s", dep, name)
+			}
+		}
+	}
+}
+
+func TestBuildOfflineHonoursTheTarget(t *testing.T) {
+	h := newHarness(t)
+	h.b.target = multiarch.Target{OS: "linux", Arch: "arm64"}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://example.com/meta", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	if got := h.pack.vendoredDeps["dep-0.tgz"]["bin/run"]; !strings.HasPrefix(got, "ELF linux/arm64") {
+		t.Errorf("bin/run = %q, want the arm64 binary", got)
+	}
+
+	// pack stamps the .cnb's image config from this; leaving it unset produces
+	// a package that declares no architecture.
+	want := []dist.Target{{OS: "linux", Arch: "arm64"}}
+	if got := h.pack.opts.Targets; len(got) != 1 || got[0].OS != want[0].OS || got[0].Arch != want[0].Arch {
+		t.Errorf("Targets = %v, want %v", got, want)
+	}
+}
+
+// A target the components do not ship must fail here rather than at build time.
+func TestBuildOfflineRejectsAnUnavailableTarget(t *testing.T) {
+	h := newHarness(t)
+	h.b.target = multiarch.Target{OS: "linux", Arch: "s390x"}
+
+	err := h.b.BuildOffline(context.Background(), "https://example.com/meta", "2.9.2",
+		filepath.Join(t.TempDir(), "out.cnb"))
+	if err == nil {
+		t.Fatal("expected an error for a platform the components do not ship")
+	}
+	if !strings.Contains(err.Error(), "linux/s390x") {
+		t.Errorf("error = %q, want it to name the missing platform", err)
 	}
 }
 
@@ -331,7 +549,7 @@ func TestBuildOfflineUsesCacheInsteadOfRebuilding(t *testing.T) {
 	h := newHarness(t)
 
 	cached := filepath.Join(t.TempDir(), "cached.tgz")
-	if err := os.WriteFile(cached, []byte("cached-archive"), 0o644); err != nil {
+	if err := writeMultiArchArchive(cached, "cached-archive"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	h.cache.entries["https://github.com/paketo-buildpacks/cpython@refs/tags/v1.18.42"] = cached
@@ -341,10 +559,12 @@ func TestBuildOfflineUsesCacheInsteadOfRebuilding(t *testing.T) {
 		t.Fatalf("BuildOffline: %v", err)
 	}
 
+	// The meta-buildpack is packed too, so dependencies are counted by the
+	// versions only they are stamped with.
 	h.jam.mu.Lock()
 	var depPacks int
 	for _, c := range h.jam.calls {
-		if strings.Contains(c.output, "deps") {
+		if c.version == "1.18.42" || c.version == "0.29.2" {
 			depPacks++
 		}
 	}
@@ -353,8 +573,36 @@ func TestBuildOfflineUsesCacheInsteadOfRebuilding(t *testing.T) {
 		t.Fatalf("jam packed %d dependencies, want 1 (cpython should have come from cache)", depPacks)
 	}
 
-	if got := h.pack.vendoredDeps["dep-0.tgz"]; got != "cached-archive" {
-		t.Errorf("dep-0.tgz = %q, want the cached bytes", got)
+	if got := h.pack.vendoredDeps["dep-0.tgz"]["buildpack.toml"]; got != "tgz:cached-archive" {
+		t.Errorf("dep-0.tgz buildpack.toml = %q, want it to come from the cached archive", got)
+	}
+}
+
+// Cache entries hold jam's own multi-arch output, so the same entry has to
+// serve any --target rather than being invalidated by one.
+func TestBuildOfflineCachesBeforeFlattening(t *testing.T) {
+	h := newHarness(t)
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://example.com/meta", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	h.cache.mu.Lock()
+	defer h.cache.mu.Unlock()
+	cached, ok := h.cache.entries["https://github.com/paketo-buildpacks/cpython@refs/tags/v1.18.42"]
+	if !ok {
+		t.Fatalf("cpython was not cached; cache holds %v", h.cache.puts)
+	}
+
+	entries := archiveEntries(t, cached)
+	if _, flattened := entries["bin/detect"]; flattened {
+		t.Errorf("the cached archive was flattened; it holds %v", sortedNames(entries))
+	}
+	for _, want := range []string{"linux/amd64/bin/detect", "linux/arm64/bin/detect"} {
+		if _, ok := entries[want]; !ok {
+			t.Errorf("cached archive is missing %s; it holds %v", want, sortedNames(entries))
+		}
 	}
 }
 

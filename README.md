@@ -23,7 +23,9 @@ The resulting bundle builds with no network access at all, at the cost of size: 
 - **Ref discovery**: components are pinned by image tag (`cpython:1.8.7`) while the source repository tags the release `v1.8.7`. `albs` lists the remote's refs and matches them rather than assuming a convention.
 - **In-process Git**: cloning uses [`go-git`](https://github.com/go-git/go-git); no `git` binary is required.
 - **Concurrent builds**: components are vendored in parallel, bounded by `--concurrency`.
-- **Caching**: built archives are cached, keyed by source ref and salted with the `jam` build that produced them. Writes are atomic.
+- **Multi-arch flattening**: component buildpacks ship binaries for several platforms under `<os>/<arch>/bin`. `albs` hoists the `--target` platform to the buildpack root, which is the only place the lifecycle looks for `bin/detect`.
+- **Caching**: built archives are cached, keyed by source ref and salted with the `jam` build that produced them. Writes are atomic. Archives are cached before flattening, so changing `--target` reuses the cache rather than invalidating it.
+- **Copy avoidance**: an offline component archive carries every dependency the buildpack declares and runs to several gigabytes. Publishing one to the cache, and vendoring one that needs no rewriting, are done with hardlinks where the filesystem allows and buffered streaming where it does not. Cache entries are marked read-only, since a hardlinked archive is reachable under several names.
 - **Registry credentials**: an existing [`docker login`](https://docs.docker.com/reference/cli/docker/login/) is picked up automatically for private and mirrored registries.
 
 ## Prerequisites
@@ -76,6 +78,7 @@ Run `albs --help` for the full flag list.
 | `--output` | `-o` | `./meta-buildpack-offline.cnb` | Path for the generated `.cnb` archive. |
 | `--cache-dir` | | `./.cache` | Directory for cached component archives. |
 | `--repo-map` | | | Path to a JSON or YAML file mapping component references to Git URLs. |
+| `--target` | | `linux/amd64` | Platform (`<os>/<arch>`) to package for. Must match the platform the resulting image is built on. |
 | `--concurrency` | `-j` | *(logical CPUs)* | Maximum parallel component builds. |
 | `--verbose` | `-v` | `false` | Verbose logging, for `albs` and `pack` alike. |
 
@@ -97,11 +100,14 @@ my-registry.internal/buildpacks/custom-node: "https://git.internal/buildpacks/cu
 2. **Parse `package.toml`** for the component references.
 3. **Resolve each component's source repository**, in order: the `--repo-map`; the `org.opencontainers.image.source` label on the image manifest, fetched with ambient registry credentials (skipped for CNB registry URNs, which name no image); the Paketo naming convention.
 4. **Vendor each component.** The pinned version is matched against the source repository's refs, since Paketo's Git tags carry a `v` prefix its image tags do not. Cached archives are reused; the rest are cloned and packaged with `jam pack --offline --version <tag>`. The version is required — component [`buildpack.toml`](https://buildpacks.io/docs/reference/config/buildpack-config/) files carry none of their own, and the meta-buildpack's order groups pin exact versions.
-5. **Package the meta-buildpack itself.** Its checked-in `[buildpack] uri` points at `build/buildpack.tgz`, an artifact of the upstream repository's packaging script that a fresh clone does not contain. Pointing `pack` at the source directory instead is not sufficient, because `buildpack.toml` carries no `version` and `pack` requires one. So the meta-buildpack is run through `jam` exactly as its components are, stamped with the version from `--tag`.
-6. **Rewrite the configuration in memory.** Dependency URIs point at the vendored archives and `[buildpack] uri` at the packaged meta-buildpack. A missing `[platform] os` defaults to `linux`, matching `pack`'s own config reader.
+5. **Flatten each component to `--target`.** A component's `pre-package` script builds for every platform in its `[[targets]]`, so `jam` emits `linux/amd64/bin/…` and `linux/arm64/bin/…` with no `bin/` at the root. The lifecycle only ever executes `<buildpack root>/bin/detect`, so the selected platform is hoisted to the root and the others dropped.
+
+   `pack` does this itself for the buildpack named by `[buildpack] uri` — see [`buildpack.PlatformRootFolder`](https://github.com/buildpacks/pack/blob/main/pkg/buildpack/multi_architecture_helper.go) — but not for `[[dependencies]]` given as URIs, which [`buildpack.FromBuildpackRootBlob`](https://github.com/buildpacks/pack/blob/main/pkg/buildpack/buildpack.go) reads verbatim. Skipping this step yields a `.cnb` that packages without complaint and then fails every detect group at build time with `fork/exec /cnb/buildpacks/<id>/<version>/bin/detect: no such file or directory`. Requesting a platform a component does not ship is an error here rather than at build time.
+6. **Package the meta-buildpack itself.** Its checked-in `[buildpack] uri` points at `build/buildpack.tgz`, an artifact of the upstream repository's packaging script that a fresh clone does not contain. Pointing `pack` at the source directory instead is not sufficient, because `buildpack.toml` carries no `version` and `pack` requires one. So the meta-buildpack is run through `jam` exactly as its components are, stamped with the version from `--tag`.
+7. **Rewrite the configuration in memory.** Dependency URIs point at the vendored archives and `[buildpack] uri` at the packaged meta-buildpack. A missing `[platform] os` defaults to `linux`, matching `pack`'s own config reader.
 
    `package.toml` is deliberately *not* rewritten on disk. `pack` resolves relative URIs against `RelativeBaseDir`, so the file is never read again, and marshalling the configuration back to TOML would emit empty `image`, `extension` and `platform` keys the original never had.
-7. **Assemble the composite** `.cnb` and remove the workspace.
+8. **Assemble the composite** `.cnb` and remove the workspace.
 
 ## Known limitations
 
@@ -109,4 +115,6 @@ my-registry.internal/buildpacks/custom-node: "https://git.internal/buildpacks/cu
 - A running Docker daemon is required. `pack`'s client constructs one from the environment unconditionally; avoiding it would mean bypassing `pkg/client` entirely.
 - `jam` is invoked as a subprocess, because its packaging logic is in an `internal/` package upstream.
 - `--tag` must name a released tag. Paketo `buildpack.toml` files carry no version, so there is nothing else to stamp the package with.
+- Cache entries are hardlinked, not copied, so a cached archive and the vendored copy `pack` reads are usually the same inode. Entries are mode `0444` to make an accidental in-place write fail rather than silently corrupt the cache. Filesystems without hardlinks, and a cache directory on a different mount from `$TMPDIR`, fall back to a buffered copy automatically.
+- One `.cnb` is produced per `--target`; `albs` does not build an OCI image index. `pack` refuses URI dependencies for multi-platform composites and requires every component to be pushed to a registry first, which defeats the point of an offline bundle.
 - `jam` binaries built with `go install` report no version. `albs` falls back to fingerprinting the binary for cache keying and skips the minimum-version check, warning as it does so.

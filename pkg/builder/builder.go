@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/adoramshoval/albs/pkg/interfaces"
+	"github.com/adoramshoval/albs/pkg/multiarch"
 	"github.com/adoramshoval/albs/pkg/resolver"
 	"github.com/buildpacks/pack/buildpackage"
 	"github.com/buildpacks/pack/pkg/client"
@@ -24,6 +25,10 @@ const depsDirName = "deps"
 // the clone.
 const metaArchiveName = "buildpack.tgz"
 
+// packedArchiveName is jam's output for a single component, held in that
+// component's own clone directory until it has been flattened into deps/.
+const packedArchiveName = "packed.tgz"
+
 type Builder struct {
 	cloner      interfaces.GitCloner
 	resolver    interfaces.OCIMetadataResolver
@@ -32,6 +37,7 @@ type Builder struct {
 	cache       interfaces.CacheManager
 	log         interfaces.Logger
 	concurrency int
+	target      multiarch.Target
 }
 
 func NewBuilder(
@@ -42,6 +48,7 @@ func NewBuilder(
 	cache interfaces.CacheManager,
 	log interfaces.Logger,
 	concurrency int,
+	target multiarch.Target,
 ) *Builder {
 	return &Builder{
 		cloner:      cloner,
@@ -51,6 +58,7 @@ func NewBuilder(
 		cache:       cache,
 		log:         log,
 		concurrency: concurrency,
+		target:      target,
 	}
 }
 
@@ -109,12 +117,17 @@ func (b *Builder) BuildOffline(ctx context.Context, gitURL, tag, outputPath stri
 	// relative URI in Config against RelativeBaseDir, so the file is never read
 	// again. Marshalling buildpackage.Config back to TOML would emit empty
 	// image/extension/platform keys the original never had.
+	// Without an explicit target pack falls back to dist.Target{OS: platform.os}
+	// with no architecture, which leaves the .cnb's image config claiming no
+	// architecture at all. One target keeps this a single-platform package, so
+	// pack still accepts the vendored deps/ URIs.
 	b.log.Infof("Packaging composite meta-buildpack into %s...", outputPath)
 	return b.packClient.PackageBuildpack(ctx, client.PackageBuildpackOptions{
 		Name:            outputPath,
 		Format:          client.FormatFile,
 		Config:          pkgConfig,
 		RelativeBaseDir: tmpDir,
+		Targets:         []dist.Target{{OS: b.target.OS, Arch: b.target.Arch}},
 	})
 }
 
@@ -175,28 +188,39 @@ func (b *Builder) buildDependency(ctx context.Context, dep dist.ImageOrURI, loca
 
 	cacheKey := fmt.Sprintf("%s@%s", repoURL, refLabel(ref))
 
-	if cachedPath, found := b.cache.Get(cacheKey); found {
+	// What is cached is jam's own output, still carrying every platform it was
+	// built for. Flattening happens afterwards so that changing --target reuses
+	// the cache instead of invalidating it.
+	packedPath, found := b.cache.Get(cacheKey)
+	if found {
 		b.log.Infof("Using cached archive for %s", cacheKey)
-		return copyFile(cachedPath, localFilePath)
+	} else {
+		b.log.Infof("Building offline package for %s...", cacheKey)
+		compDir, err := os.MkdirTemp("", "comp-bp-*")
+		if err != nil {
+			return err
+		}
+		// Deferred to the end of the call rather than the end of this block:
+		// packedPath lives in here and is read by the flattening below.
+		defer os.RemoveAll(compDir)
+
+		if err := b.cloner.Clone(ctx, repoURL, ref, compDir); err != nil {
+			return fmt.Errorf("failed to clone component repo %s: %w", repoURL, err)
+		}
+
+		packedPath = filepath.Join(compDir, packedArchiveName)
+		if err := b.jamPacker.PackOffline(ctx, compDir, parsed.Tag, packedPath); err != nil {
+			return fmt.Errorf("failed jam pack for %s: %w", repoURL, err)
+		}
+
+		if err := b.cache.Put(cacheKey, packedPath); err != nil {
+			b.log.Warnf("could not cache %s: %v", cacheKey, err)
+		}
 	}
 
-	b.log.Infof("Building offline package for %s...", cacheKey)
-	compDir, err := os.MkdirTemp("", "comp-bp-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(compDir)
-
-	if err := b.cloner.Clone(ctx, repoURL, ref, compDir); err != nil {
-		return fmt.Errorf("failed to clone component repo %s: %w", repoURL, err)
-	}
-
-	if err := b.jamPacker.PackOffline(ctx, compDir, parsed.Tag, localFilePath); err != nil {
-		return fmt.Errorf("failed jam pack for %s: %w", repoURL, err)
-	}
-
-	if err := b.cache.Put(cacheKey, localFilePath); err != nil {
-		b.log.Warnf("could not cache %s: %v", cacheKey, err)
+	b.log.Debugf("Flattening %s to %s", cacheKey, b.target)
+	if err := multiarch.Flatten(packedPath, localFilePath, b.target); err != nil {
+		return fmt.Errorf("preparing %s for %s: %w", cacheKey, b.target, err)
 	}
 	return nil
 }
@@ -251,12 +275,4 @@ func refLabel(ref string) string {
 		return "default branch"
 	}
 	return ref
-}
-
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0o644)
 }

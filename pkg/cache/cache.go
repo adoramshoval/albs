@@ -3,11 +3,13 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
+	"github.com/adoramshoval/albs/pkg/fsutil"
 	"github.com/adoramshoval/albs/pkg/interfaces"
 )
 
@@ -35,38 +37,56 @@ func (c *DiskCache) Get(key string) (string, bool) {
 	return "", false
 }
 
-// Put writes via a temporary file and renames into place. rename is atomic on
-// POSIX, so concurrent writers of the same key cannot observe a torn archive
-// and an interrupted run cannot leave a truncated entry behind that later runs
-// would trust.
+// entryMode marks cache entries read-only.
+//
+// Entries are hardlinked rather than copied wherever the filesystem allows, so
+// a cached archive, jam's output it was linked from, and the vendored copy pack
+// reads can all be the same inode. Nothing in albs rewrites an archive in
+// place, and this makes the filesystem enforce that rather than leaving it as
+// an invariant someone has to remember.
+const entryMode fs.FileMode = 0o444
+
+// Put publishes srcFilePath under key, hardlinking it into the cache when the
+// filesystem allows and copying it when it does not.
+//
+// Both paths publish atomically. A hardlink is created fully formed under its
+// final name, so there is no intermediate state to observe; a copy is written
+// to a temporary file and renamed, rename being atomic on POSIX. Either way a
+// concurrent reader never sees a torn archive, and an interrupted run leaves
+// nothing truncated behind for a later run to trust.
 func (c *DiskCache) Put(key, srcFilePath string) (err error) {
 	destPath := c.pathFor(key)
 
-	srcFile, err := os.Open(srcFilePath)
-	if err != nil {
-		return err
+	// Linking costs the same whether the archive is a kilobyte or five
+	// gigabytes, which for offline component archives is the difference that
+	// matters.
+	if err := os.Link(srcFilePath, destPath); err == nil {
+		return os.Chmod(destPath, entryMode)
+	} else if errors.Is(err, fs.ErrExist) {
+		// Another worker published this key first. Its entry is as good as
+		// ours, since the key already pins the source ref and packer version.
+		return nil
 	}
-	defer srcFile.Close()
 
 	tmpFile, err := os.CreateTemp(c.baseDir, ".tmp-*")
 	if err != nil {
 		return err
 	}
 	tmpPath := tmpFile.Name()
+	if err = tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 	defer func() {
 		if err != nil {
 			os.Remove(tmpPath)
 		}
 	}()
 
-	if _, err = io.Copy(tmpFile, srcFile); err != nil {
-		tmpFile.Close()
+	if err = fsutil.Copy(srcFilePath, tmpPath); err != nil {
 		return err
 	}
-	if err = tmpFile.Close(); err != nil {
-		return err
-	}
-	if err = os.Chmod(tmpPath, 0o644); err != nil {
+	if err = os.Chmod(tmpPath, entryMode); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, destPath)

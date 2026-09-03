@@ -149,3 +149,97 @@ func TestConcurrentPutIsAtomic(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// Publishing a multi-gigabyte offline archive must not move its bytes when the
+// cache and the source share a filesystem.
+func TestPutLinksInsteadOfCopying(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewDiskCache(dir, "salt")
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	src := writeFile(t, filepath.Join(t.TempDir(), "dep.tgz"), "bytes")
+	if err := c.Put("repo@ref", src); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	cached, found := c.Get("repo@ref")
+	if !found {
+		t.Fatal("entry was not published")
+	}
+
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat src: %v", err)
+	}
+	cachedInfo, err := os.Stat(cached)
+	if err != nil {
+		t.Fatalf("stat cached: %v", err)
+	}
+	if !os.SameFile(srcInfo, cachedInfo) {
+		t.Error("Put copied the archive instead of linking it")
+	}
+}
+
+// Entries are shared by hardlink with the vendored archives pack reads, so a
+// write through any of those names would corrupt the cache. Read-only makes the
+// filesystem enforce what would otherwise be an unwritten rule.
+func TestPutMarksEntriesReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewDiskCache(dir, "salt")
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	src := writeFile(t, filepath.Join(t.TempDir(), "dep.tgz"), "bytes")
+	if err := c.Put("repo@ref", src); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	cached, _ := c.Get("repo@ref")
+	info, err := os.Stat(cached)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != entryMode {
+		t.Errorf("entry mode = %v, want %v", got, entryMode)
+	}
+
+	if err := os.WriteFile(cached, []byte("corrupted"), 0o444); err == nil {
+		t.Error("a cached entry accepted an in-place write")
+	}
+}
+
+// Re-publishing a key happens whenever two runs overlap. The key already pins
+// the source ref and packer version, so an existing entry is as good as ours.
+func TestPutIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewDiskCache(dir, "salt")
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	srcDir := t.TempDir()
+	first := writeFile(t, filepath.Join(srcDir, "a.tgz"), "bytes")
+	second := writeFile(t, filepath.Join(srcDir, "b.tgz"), "bytes")
+
+	if err := c.Put("repo@ref", first); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	if err := c.Put("repo@ref", second); err != nil {
+		t.Fatalf("second Put: %v", err)
+	}
+
+	cached, found := c.Get("repo@ref")
+	if !found {
+		t.Fatal("entry disappeared")
+	}
+	data, err := os.ReadFile(cached)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != "bytes" {
+		t.Errorf("entry = %q, want %q", data, "bytes")
+	}
+}

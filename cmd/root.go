@@ -10,6 +10,7 @@ import (
 	"github.com/adoramshoval/albs/pkg/cache"
 	"github.com/adoramshoval/albs/pkg/config"
 	"github.com/adoramshoval/albs/pkg/git"
+	"github.com/adoramshoval/albs/pkg/multiarch"
 	"github.com/adoramshoval/albs/pkg/packer"
 	"github.com/adoramshoval/albs/pkg/resolver"
 	packlogging "github.com/buildpacks/pack/pkg/logging"
@@ -22,6 +23,7 @@ var (
 	outputPath  string
 	cacheDir    string
 	repoMapPath string
+	targetSpec  string
 	concurrency int
 	verbose     bool
 )
@@ -44,6 +46,11 @@ var rootCmd = &cobra.Command{
 
 func run(ctx context.Context) error {
 	log := newLogger()
+
+	target, err := multiarch.ParseTarget(targetSpec)
+	if err != nil {
+		return err
+	}
 
 	repoMap, err := config.LoadRepoMap(repoMapPath)
 	if err != nil {
@@ -81,6 +88,7 @@ func run(ctx context.Context) error {
 		diskCache,
 		log,
 		concurrency,
+		target,
 	)
 
 	return b.BuildOffline(ctx, gitURL, tag, outputPath)
@@ -105,6 +113,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "./meta-buildpack-offline.cnb", "Output path for generated .cnb archive")
 	rootCmd.Flags().StringVar(&cacheDir, "cache-dir", "./.cache", "Local directory path for caching component archives")
 	rootCmd.Flags().StringVar(&repoMapPath, "repo-map", "", "Path to JSON/YAML file mapping image URIs to Git URLs (e.g. repo-map.json or repo-map.yaml)")
+	rootCmd.Flags().StringVar(&targetSpec, "target", "linux/amd64", "Platform (<os>/<arch>) to package for; component buildpacks ship binaries for several, and only one can sit at the buildpack root")
 	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "j", runtime.NumCPU(), "Maximum concurrent component builds")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
 
