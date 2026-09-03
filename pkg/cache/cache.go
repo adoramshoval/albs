@@ -92,8 +92,57 @@ func (c *DiskCache) Put(key, srcFilePath string) (err error) {
 	return os.Rename(tmpPath, destPath)
 }
 
+// GetMeta returns the metadata stored beside key's archive.
+//
+// A miss is ordinary rather than exceptional: entries cached before metadata
+// was recorded have none, and the caller falls back to what the archive itself
+// can tell it.
+func (c *DiskCache) GetMeta(key string) ([]byte, bool) {
+	data, err := os.ReadFile(c.metaPathFor(key))
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+	return data, true
+}
+
+// PutMeta stores metadata beside key's archive.
+//
+// Written to a temporary file and renamed, so a reader never sees a partial
+// blob and an interrupted run leaves nothing truncated for a later one to
+// trust -- the same guarantee Put gives the archive.
+func (c *DiskCache) PutMeta(key string, data []byte) (err error) {
+	tmpFile, err := os.CreateTemp(c.baseDir, ".tmpmeta-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err = tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if err = tmpFile.Close(); err != nil {
+		return err
+	}
+	if err = os.Chmod(tmpPath, entryMode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, c.metaPathFor(key))
+}
+
 func (c *DiskCache) pathFor(key string) string {
 	return filepath.Join(c.baseDir, c.hashKey(key)+".tgz")
+}
+
+// metaPathFor sits beside pathFor under the same hash, so an archive and its
+// metadata share a name and are obvious as a pair in a directory listing.
+func (c *DiskCache) metaPathFor(key string) string {
+	return filepath.Join(c.baseDir, c.hashKey(key)+".buildpack.toml")
 }
 
 func (c *DiskCache) hashKey(key string) string {

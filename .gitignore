@@ -2,3 +2,4 @@
 bin/
 .cache/
 *.cnb
+*.versions.json
