@@ -32,10 +32,20 @@ type PackClient interface {
 	PackageBuildpack(ctx context.Context, opts client.PackageBuildpackOptions) error
 }
 
-// CacheManager provides caching mechanisms for generated component archives.
+// CacheManager provides caching mechanisms for generated component archives,
+// and for a small metadata blob stored alongside each one.
+//
+// The metadata exists because packaging is lossy: jam rewrites every
+// dependency uri to a local path and drops source entirely, so facts about the
+// original buildpack cannot be recovered from the archive it produced. They
+// are kept beside it instead.
 type CacheManager interface {
 	Get(key string) (string, bool)
 	Put(key, srcFilePath string) error
+	// GetMeta returns the metadata stored under key. Entries cached before
+	// metadata was recorded simply report false.
+	GetMeta(key string) ([]byte, bool)
+	PutMeta(key string, data []byte) error
 }
 
 // Logger reports progress. Debug output is suppressed unless --verbose is set.

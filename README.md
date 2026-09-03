@@ -79,6 +79,7 @@ Run `albs --help` for the full flag list.
 | `--cache-dir` | | `./.cache` | Directory for cached component archives. |
 | `--repo-map` | | | Path to a JSON or YAML file mapping component references to Git URLs. |
 | `--target` | | `linux/amd64` | Platform (`<os>/<arch>`) to package for. Must match the platform the resulting image is built on. |
+| `--stack` | | | Stack to assert dependency coverage against, as a full id (`io.buildpacks.stacks.jammy`) or a bare name (`jammy`). Reports without failing when unset. |
 | `--concurrency` | `-j` | *(logical CPUs)* | Maximum parallel component builds. |
 | `--verbose` | `-v` | `false` | Verbose logging, for `albs` and `pack` alike. |
 
@@ -108,6 +109,32 @@ my-registry.internal/buildpacks/custom-node: "https://git.internal/buildpacks/cu
 
    `package.toml` is deliberately *not* rewritten on disk. `pack` resolves relative URIs against `RelativeBaseDir`, so the file is never read again, and marshalling the configuration back to TOML would emit empty `image`, `extension` and `platform` keys the original never had.
 8. **Assemble the composite** `.cnb` and remove the workspace.
+
+### Stack coverage
+
+Component buildpacks declare `stacks = ["*"]`, and a meta-buildpack declares no `[[stacks]]` at all, so nothing in a tag names the stack it needs. The real coupling is one level down: each `[[metadata.dependencies]]` entry records the distro and architecture its artifact was built for, and `jam` downloads every entry regardless — a packaged bundle carries them all and is stack-agnostic.
+
+`--stack` asserts what that leaves unchecked: whether the components a build actually needs have artifacts for the stack and architecture you run.
+
+```bash
+./bin/albs \
+  --git-url https://github.com/paketo-buildpacks/go \
+  --tag v4.16.14 \
+  --stack jammy \
+  --output ./go-offline.cnb
+```
+
+Coverage is a property of an `[[order]]` group, not of the component list: a tag is covered when **at least one** group has every non-optional member covered. Paketo's Go meta-buildpack has two groups differing in whether `go-mod-vendor` is required, so a rule that gated on every required component anywhere would reject tags that build perfectly through their other group.
+
+The check runs after each component is cloned and before `jam` vendors it, which is the last moment before the expensive step. A component required by *every* group fails the build immediately, since no group can succeed without it; one required by only some is recorded and left to the final verdict, which cannot be reached until the others have been evaluated.
+
+Either way a `<output>.versions.json` sidecar is written — on the failing path too, since it names which stacks the tag *does* support. It lists every component, its dependencies with their stacks and architectures, and which of them matched.
+
+Each dependency is also classified `prebuilt`, `source` or `unknown`, and a component whose every matching entry is `source` is flagged as compiled at build time. The stacks field cannot answer this: `go-dist` publishes a prebuilt static toolchain under `stacks = ["*"]` while `cpython` publishes a source tarball under the same wildcard. What separates them is whether `uri` and `source` name the same file.
+
+`unknown` appears only when provenance was unavailable. `jam pack --offline` rewrites every `uri` to `file:///dependencies/<sha>` and drops `source`, so a packaged archive cannot answer this. The original `buildpack.toml` is therefore cached beside each archive as `<hash>.buildpack.toml` while it still exists, and a cache hit reads that — a warm run reports exactly what a cold one did. Entries cached before this was recorded fall back to the archive, where coverage still resolves, since `stacks` survives packaging, but provenance reads `unknown`.
+
+Because a failure cancels the components still being checked, a report can be partial; `verdict.complete` says so, and unevaluated components carry `"evaluated": false` rather than passing silently. `--concurrency 1` produces a complete, deterministic report.
 
 ## Known limitations
 

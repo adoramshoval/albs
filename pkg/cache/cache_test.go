@@ -243,3 +243,64 @@ func TestPutIsIdempotent(t *testing.T) {
 		t.Errorf("entry = %q, want %q", data, "bytes")
 	}
 }
+
+func TestMetaRoundTrip(t *testing.T) {
+	c, err := NewDiskCache(t.TempDir(), "salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := c.GetMeta("absent"); ok {
+		t.Error("GetMeta reported a hit for a key that was never stored")
+	}
+
+	body := []byte("api = \"0.7\"\n")
+	if err := c.PutMeta("k", body); err != nil {
+		t.Fatalf("PutMeta: %v", err)
+	}
+	got, ok := c.GetMeta("k")
+	if !ok || string(got) != string(body) {
+		t.Errorf("GetMeta = %q, %v; want %q, true", got, ok, body)
+	}
+}
+
+// TestMetaIsSaltedWithTheArchive keeps metadata from outliving the archive it
+// describes: upgrading jam changes the key, and a stale buildpack.toml must
+// not be served alongside a freshly built entry.
+func TestMetaIsSaltedWithTheArchive(t *testing.T) {
+	dir := t.TempDir()
+
+	old, err := NewDiskCache(dir, "jam-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.PutMeta("k", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := NewDiskCache(dir, "jam-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := fresh.GetMeta("k"); ok {
+		t.Errorf("GetMeta returned %q across a salt change; entries must not be shared", got)
+	}
+}
+
+// TestPutMetaOverwrites matters because entries are mode 0444: a rename over an
+// existing read-only file has to succeed, or a rebuild would fail to refresh.
+func TestPutMetaOverwrites(t *testing.T) {
+	c, err := NewDiskCache(t.TempDir(), "salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PutMeta("k", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PutMeta("k", []byte("second")); err != nil {
+		t.Fatalf("PutMeta over an existing entry: %v", err)
+	}
+	if got, _ := c.GetMeta("k"); string(got) != "second" {
+		t.Errorf("GetMeta = %q, want %q", got, "second")
+	}
+}

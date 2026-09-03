@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/adoramshoval/albs/pkg/multiarch"
+	"github.com/adoramshoval/albs/pkg/preflight"
 	"github.com/adoramshoval/albs/pkg/testsupport"
 	"github.com/buildpacks/pack/pkg/client"
 	"github.com/buildpacks/pack/pkg/dist"
@@ -30,11 +32,37 @@ const metaPackageTOML = `[buildpack]
   uri = "docker://docker.io/paketobuildpacks/pip:0.29.2"
 `
 
+// metaBuildpackTOML stands in for the meta-buildpack's own buildpack.toml,
+// which carries the order groups coverage is judged against. cpython is
+// required in both groups, pip in the second only, so the two differ in
+// whether a gap in them can fail the build on its own.
+const metaBuildpackTOML = `api = "0.7"
+
+[buildpack]
+  id = "paketo-buildpacks/python"
+
+[[order]]
+  [[order.group]]
+    id = "paketo-buildpacks/cpython"
+
+[[order]]
+  [[order.group]]
+    id = "paketo-buildpacks/cpython"
+  [[order.group]]
+    id = "paketo-buildpacks/pip"
+`
+
 type fakeCloner struct {
 	mu sync.Mutex
 	// packageTOML is written into the first clone target, standing in for the
 	// meta-buildpack repository.
 	packageTOML string
+	// buildpackTOML is the meta-buildpack's own buildpack.toml. Empty uses
+	// metaBuildpackTOML.
+	buildpackTOML string
+	// componentTOML overrides a component's buildpack.toml, keyed by the last
+	// segment of its repository URL.
+	componentTOML map[string]string
 	// noPackageTOML simulates a repository that has no package.toml.
 	noPackageTOML bool
 	refs          map[string]string
@@ -82,9 +110,24 @@ func (f *fakeCloner) Clone(_ context.Context, repoURL, ref, targetDir string) er
 		if f.noPackageTOML {
 			return nil
 		}
-		return os.WriteFile(filepath.Join(targetDir, "package.toml"), []byte(f.packageTOML), 0o644)
+		if err := os.WriteFile(filepath.Join(targetDir, "package.toml"), []byte(f.packageTOML), 0o644); err != nil {
+			return err
+		}
+		body := f.buildpackTOML
+		if body == "" {
+			body = metaBuildpackTOML
+		}
+		return os.WriteFile(filepath.Join(targetDir, "buildpack.toml"), []byte(body), 0o644)
 	}
-	return os.WriteFile(filepath.Join(targetDir, "buildpack.toml"), []byte("api = \"0.7\"\n"), 0o644)
+
+	name := repoName(repoURL)
+	body, ok := f.componentTOML[name]
+	if !ok {
+		// A component declaring no dependencies has nothing that could have
+		// been built for the wrong stack, so it never gates.
+		body = fmt.Sprintf("api = \"0.7\"\n\n[buildpack]\n  id = \"paketo-buildpacks/%s\"\n", name)
+	}
+	return os.WriteFile(filepath.Join(targetDir, "buildpack.toml"), []byte(body), 0o644)
 }
 
 type fakeResolver struct{ err error }
@@ -123,6 +166,14 @@ func (f *fakeJam) PackOffline(_ context.Context, srcDir, version, outputTgzPath 
 	return writeMultiArchArchive(outputTgzPath, version)
 }
 
+// archiveBuildpackTOML is the buildpack.toml written into a fake archive. It
+// has to be valid TOML, since the preflight reads it from the archive on the
+// cache-hit path, and it carries the version so that assertions can tell one
+// archive from another. cpython is the only component these tests cache.
+func archiveBuildpackTOML(version string) string {
+	return fmt.Sprintf("api = \"0.7\"\n\n[buildpack]\n  id = \"paketo-buildpacks/cpython\"\n  version = %q\n", version)
+}
+
 // writeMultiArchArchive mirrors what jam pack emits for a component buildpack:
 // no bin/ at the root, one bin/ per platform, and detect as a same-directory
 // symlink to run.
@@ -136,7 +187,7 @@ func writeMultiArchArchive(path, version string) error {
 	gw := gzip.NewWriter(f)
 	tw := tar.NewWriter(gw)
 
-	body := "tgz:" + version
+	body := archiveBuildpackTOML(version)
 	if err := tw.WriteHeader(&tar.Header{
 		Name: "buildpack.toml", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
 	}); err != nil {
@@ -289,14 +340,35 @@ type fakeCache struct {
 	// workspace that BuildOffline deletes before returning.
 	dir     string
 	entries map[string]string
+	meta    map[string][]byte
 	gets    []string
 	puts    []string
 	putErr  error
+	// metaPutErr fails PutMeta only, so that losing provenance can be
+	// exercised separately from losing the archive.
+	metaPutErr error
 }
 
 func newFakeCache(t *testing.T) *fakeCache {
 	t.Helper()
-	return &fakeCache{dir: t.TempDir(), entries: map[string]string{}}
+	return &fakeCache{dir: t.TempDir(), entries: map[string]string{}, meta: map[string][]byte{}}
+}
+
+func (f *fakeCache) GetMeta(key string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.meta[key]
+	return data, ok
+}
+
+func (f *fakeCache) PutMeta(key string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.metaPutErr != nil {
+		return f.metaPutErr
+	}
+	f.meta[key] = append([]byte(nil), data...)
+	return nil
 }
 
 func (f *fakeCache) Get(key string) (string, bool) {
@@ -337,6 +409,14 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newStackHarness(t, "")
+}
+
+// newStackHarness builds a harness asserting coverage against stack. An empty
+// stack leaves the preflight reporting without failing, which is what every
+// pre-existing test expects.
+func newStackHarness(t *testing.T, stack string) *harness {
+	t.Helper()
 	h := &harness{
 		cloner: &fakeCloner{packageTOML: metaPackageTOML},
 		jam:    &fakeJam{},
@@ -344,7 +424,7 @@ func newHarness(t *testing.T) *harness {
 		cache:  newFakeCache(t),
 	}
 	h.b = NewBuilder(h.cloner, fakeResolver{}, h.jam, h.pack, h.cache, testsupport.Logger{}, 2,
-		multiarch.Target{OS: "linux", Arch: "amd64"})
+		multiarch.Target{OS: "linux", Arch: "amd64"}, stack)
 	return h
 }
 
@@ -573,7 +653,7 @@ func TestBuildOfflineUsesCacheInsteadOfRebuilding(t *testing.T) {
 		t.Fatalf("jam packed %d dependencies, want 1 (cpython should have come from cache)", depPacks)
 	}
 
-	if got := h.pack.vendoredDeps["dep-0.tgz"]["buildpack.toml"]; got != "tgz:cached-archive" {
+	if got := h.pack.vendoredDeps["dep-0.tgz"]["buildpack.toml"]; got != archiveBuildpackTOML("cached-archive") {
 		t.Errorf("dep-0.tgz buildpack.toml = %q, want it to come from the cached archive", got)
 	}
 }
@@ -809,4 +889,310 @@ func TestVersionFromRef(t *testing.T) {
 			t.Errorf("versionFromRef(%q) = %q, want %q", tt.ref, got, tt.want)
 		}
 	}
+}
+
+// componentWithDeps is a component buildpack.toml declaring one dependency,
+// so that a stack and arch can be asserted against it.
+func componentWithDeps(id, stack, arch string) string {
+	return fmt.Sprintf(`api = "0.7"
+
+[buildpack]
+  id = %q
+
+[[metadata.dependencies]]
+  id = "python"
+  version = "3.10.20"
+  arch = %q
+  stacks = [%q]
+`, id, arch, stack)
+}
+
+func TestBuildOfflineWritesReportWithoutStack(t *testing.T) {
+	h := newHarness(t)
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	report := readReport(t, out)
+	if report.Identity.Stack != "" {
+		t.Errorf("Stack = %q, want empty", report.Identity.Stack)
+	}
+	if !report.Verdict.Covered || !report.Verdict.Complete {
+		t.Errorf("Verdict = %+v, want covered and complete when nothing is asserted", report.Verdict)
+	}
+	if len(report.Components) != 2 {
+		t.Fatalf("got %d components, want 2", len(report.Components))
+	}
+	for _, c := range report.Components {
+		if !c.Evaluated {
+			t.Errorf("component %q was not evaluated", c.ID)
+		}
+	}
+}
+
+func TestBuildOfflineFailsFastOnUniversallyRequiredComponent(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	// cpython is required by both order groups, so no group can succeed
+	// without it and stopping immediately is sound.
+	h.cloner.componentTOML = map[string]string{
+		"cpython": componentWithDeps("paketo-buildpacks/cpython", "io.buildpacks.stacks.noble", "amd64"),
+	}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out)
+
+	var covErr *preflight.CoverageError
+	if !errors.As(err, &covErr) {
+		t.Fatalf("BuildOffline error = %v, want a *preflight.CoverageError", err)
+	}
+	if len(covErr.Missing) != 1 || covErr.Missing[0] != "paketo-buildpacks/cpython" {
+		t.Errorf("Missing = %v, want [paketo-buildpacks/cpython]", covErr.Missing)
+	}
+
+	// jam is the expensive step; the whole point is not reaching it.
+	h.jam.mu.Lock()
+	defer h.jam.mu.Unlock()
+	for _, c := range h.jam.calls {
+		if c.version == "1.18.42" {
+			t.Error("jam vendored cpython despite it having no coverage")
+		}
+	}
+}
+
+func TestBuildOfflineWritesReportOnFailure(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	h.cloner.componentTOML = map[string]string{
+		"cpython": componentWithDeps("paketo-buildpacks/cpython", "io.buildpacks.stacks.noble", "amd64"),
+	}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err == nil {
+		t.Fatal("BuildOffline succeeded despite no coverage")
+	}
+
+	// The report is the diagnosis: it has to survive a run that produced no
+	// .cnb, and it has to name which stacks the tag does support.
+	report := readReport(t, out)
+	if report.Verdict.Covered {
+		t.Error("report says covered although the build failed on coverage")
+	}
+
+	var cpython *preflight.Component
+	for i := range report.Components {
+		if report.Components[i].ID == "paketo-buildpacks/cpython" {
+			cpython = &report.Components[i]
+		}
+	}
+	if cpython == nil {
+		t.Fatal("the component that failed is missing from its own report")
+	}
+	if len(cpython.Dependencies) != 1 || cpython.Dependencies[0].Stacks[0] != "io.buildpacks.stacks.noble" {
+		t.Errorf("dependencies = %+v, want the noble entry recorded", cpython.Dependencies)
+	}
+}
+
+func TestBuildOfflineDefersVerdictForPartiallyRequiredComponent(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	// pip is required by the second order group only. The first needs just
+	// cpython, so the tag still builds and must not be rejected.
+	h.cloner.componentTOML = map[string]string{
+		"pip": componentWithDeps("paketo-buildpacks/pip", "io.buildpacks.stacks.noble", "amd64"),
+	}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	report := readReport(t, out)
+	if !report.Verdict.Covered {
+		t.Error("Covered = false although order group 0 needs only cpython")
+	}
+	if len(report.Verdict.SatisfiedGroups) != 1 || report.Verdict.SatisfiedGroups[0] != 0 {
+		t.Errorf("SatisfiedGroups = %v, want [0]", report.Verdict.SatisfiedGroups)
+	}
+}
+
+func TestBuildOfflineRejectsWrongArchOnRightStack(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	// Right stack, wrong architecture: a stack-only check would pass this and
+	// the build would fail later for a reason nothing had reported.
+	h.cloner.componentTOML = map[string]string{
+		"cpython": componentWithDeps("paketo-buildpacks/cpython", "io.buildpacks.stacks.jammy", "arm64"),
+	}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out)
+
+	var covErr *preflight.CoverageError
+	if !errors.As(err, &covErr) {
+		t.Fatalf("BuildOffline error = %v, want a *preflight.CoverageError", err)
+	}
+}
+
+func TestBuildOfflineChecksCachedComponentsFromTheArchive(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+
+	// A cache hit never clones, so the archive is the only place the
+	// buildpack.toml can be read from.
+	cached := filepath.Join(t.TempDir(), "cached.tgz")
+	if err := writeMultiArchArchive(cached, "cached-archive"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.cache.entries["https://github.com/paketo-buildpacks/cpython@refs/tags/v1.18.42"] = cached
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	report := readReport(t, out)
+	for _, c := range report.Components {
+		if c.ID == "paketo-buildpacks/cpython" {
+			if !c.Evaluated {
+				t.Error("the cached component was never evaluated")
+			}
+			return
+		}
+	}
+	t.Error("the cached component is missing from the report")
+}
+
+func readReport(t *testing.T, outputPath string) preflight.Report {
+	t.Helper()
+
+	data, err := os.ReadFile(preflight.SidecarPath(outputPath))
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	var r preflight.Report
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("decoding report: %v", err)
+	}
+	return r
+}
+
+// cpythonSourceOnly declares a jammy dependency whose uri is its own source,
+// which is cpython's real shape for its portable fallback.
+const cpythonSourceOnly = `api = "0.7"
+
+[buildpack]
+  id = "paketo-buildpacks/cpython"
+
+[[metadata.dependencies]]
+  id = "python"
+  version = "3.10.20"
+  arch = "amd64"
+  stacks = ["io.buildpacks.stacks.jammy"]
+  uri = "https://www.python.org/ftp/python/3.10.20/Python-3.10.20.tgz"
+  source = "https://www.python.org/ftp/python/3.10.20/Python-3.10.20.tgz"
+`
+
+const cpythonKey = "https://github.com/paketo-buildpacks/cpython@refs/tags/v1.18.42"
+
+// TestBuildOfflineCachesBuildpackTOML pins that provenance is recorded while it
+// still exists. jam rewrites every uri and drops source, so the packaged
+// archive cannot answer this afterwards.
+func TestBuildOfflineCachesBuildpackTOML(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	h.cloner.componentTOML = map[string]string{"cpython": cpythonSourceOnly}
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	got, ok := h.cache.GetMeta(cpythonKey)
+	if !ok {
+		t.Fatal("no buildpack.toml was cached for cpython")
+	}
+	if string(got) != cpythonSourceOnly {
+		t.Errorf("cached buildpack.toml = %q, want the original", got)
+	}
+}
+
+// TestBuildOfflineReadsProvenanceFromCache is the point of caching it: a run
+// that never clones still reports how a dependency would be satisfied.
+func TestBuildOfflineReadsProvenanceFromCache(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+
+	cached := filepath.Join(t.TempDir(), "cached.tgz")
+	if err := writeMultiArchArchive(cached, "cached-archive"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.cache.entries[cpythonKey] = cached
+	h.cache.meta[cpythonKey] = []byte(cpythonSourceOnly)
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	c := componentByID(t, readReport(t, out), "paketo-buildpacks/cpython")
+	if !c.Covered || !c.CoveredOnlyBySource {
+		t.Errorf("Covered=%v CoveredOnlyBySource=%v, want true/true from the cached original",
+			c.Covered, c.CoveredOnlyBySource)
+	}
+	if c.Dependencies[0].Artifact != preflight.ArtifactSource {
+		t.Errorf("Artifact = %q, want %q", c.Dependencies[0].Artifact, preflight.ArtifactSource)
+	}
+}
+
+// TestBuildOfflineFallsBackToArchiveWithoutMeta covers caches written before
+// metadata was recorded: coverage still resolves, because jam preserves the
+// stacks field, and provenance degrades to unknown rather than being guessed.
+func TestBuildOfflineFallsBackToArchiveWithoutMeta(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+
+	cached := filepath.Join(t.TempDir(), "cached.tgz")
+	if err := writeMultiArchArchive(cached, "cached-archive"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.cache.entries[cpythonKey] = cached // no meta entry
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	c := componentByID(t, readReport(t, out), "paketo-buildpacks/cpython")
+	if !c.Covered {
+		t.Error("Covered = false; the archive still carries stacks")
+	}
+	if c.CoveredOnlyBySource {
+		t.Error("CoveredOnlyBySource = true although the archive cannot report provenance")
+	}
+}
+
+// TestBuildOfflineSurvivesMetadataWriteFailure keeps a cache that cannot store
+// metadata from failing the build: what is lost is a later run's provenance,
+// not this run's correctness.
+func TestBuildOfflineSurvivesMetadataWriteFailure(t *testing.T) {
+	h := newStackHarness(t, "io.buildpacks.stacks.jammy")
+	h.cloner.componentTOML = map[string]string{"cpython": cpythonSourceOnly}
+	h.cache.metaPutErr = errors.New("disk full")
+
+	out := filepath.Join(t.TempDir(), "out.cnb")
+	if err := h.b.BuildOffline(context.Background(), "https://github.com/paketo-buildpacks/python", "2.9.2", out); err != nil {
+		t.Fatalf("BuildOffline: %v", err)
+	}
+
+	// This run read from the clone, so it still knows.
+	c := componentByID(t, readReport(t, out), "paketo-buildpacks/cpython")
+	if !c.CoveredOnlyBySource {
+		t.Error("CoveredOnlyBySource = false; this run had the original in hand")
+	}
+}
+
+func componentByID(t *testing.T, r preflight.Report, id string) preflight.Component {
+	t.Helper()
+	for _, c := range r.Components {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("component %q is missing from the report", id)
+	return preflight.Component{}
 }

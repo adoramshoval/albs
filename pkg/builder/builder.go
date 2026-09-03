@@ -9,6 +9,7 @@ import (
 
 	"github.com/adoramshoval/albs/pkg/interfaces"
 	"github.com/adoramshoval/albs/pkg/multiarch"
+	"github.com/adoramshoval/albs/pkg/preflight"
 	"github.com/adoramshoval/albs/pkg/resolver"
 	"github.com/buildpacks/pack/buildpackage"
 	"github.com/buildpacks/pack/pkg/client"
@@ -38,6 +39,10 @@ type Builder struct {
 	log         interfaces.Logger
 	concurrency int
 	target      multiarch.Target
+	// stack is the full stack id coverage is asserted against. Empty leaves
+	// the preflight reporting what each dependency declares without failing
+	// on it, which keeps every existing invocation working unchanged.
+	stack string
 }
 
 func NewBuilder(
@@ -49,6 +54,7 @@ func NewBuilder(
 	log interfaces.Logger,
 	concurrency int,
 	target multiarch.Target,
+	stack string,
 ) *Builder {
 	return &Builder{
 		cloner:      cloner,
@@ -59,6 +65,7 @@ func NewBuilder(
 		log:         log,
 		concurrency: concurrency,
 		target:      target,
+		stack:       stack,
 	}
 }
 
@@ -84,14 +91,47 @@ func (b *Builder) BuildOffline(ctx context.Context, gitURL, tag, outputPath stri
 		return err
 	}
 
+	// The order groups live in the meta-buildpack's own buildpack.toml, not in
+	// package.toml: package.toml lists every component, while the groups say
+	// which of them a build actually needs. Coverage is a property of a group,
+	// so both files are required to judge it.
+	metaBP, err := preflight.ParseDir(tmpDir)
+	if err != nil {
+		return err
+	}
+
 	depsDir := filepath.Join(tmpDir, depsDirName)
 	if err := os.MkdirAll(depsDir, 0o755); err != nil {
 		return err
 	}
 
-	updatedDeps, err := b.buildDependencies(ctx, pkgConfig.Dependencies, depsDir)
-	if err != nil {
-		return err
+	updatedDeps, components, buildErr := b.buildDependencies(ctx, pkgConfig.Dependencies, depsDir, metaBP.Order)
+
+	// The report is written on both paths. On the failure path it is the
+	// diagnosis -- it names which stacks the tag does support -- so it has to
+	// survive a run that produces no .cnb at all.
+	report := b.report(gitURL, tag, metaBP.Order, components)
+	sidecar := preflight.SidecarPath(outputPath)
+	if err := preflight.Write(sidecar, report); err != nil {
+		b.log.Warnf("could not write preflight report: %v", err)
+	} else {
+		b.log.Debugf("Preflight report written to %s", sidecar)
+	}
+	b.log.Infof("Preflight: %s", report.Summary())
+
+	if buildErr != nil {
+		return buildErr
+	}
+	// A component required by only some groups cannot fail the build on its
+	// own, so a verdict of no satisfiable group is reached here rather than in
+	// the goroutine that found the gap.
+	if !report.Verdict.Covered {
+		return &preflight.CoverageError{
+			Stack:   b.stack,
+			Target:  b.target.String(),
+			Missing: report.Verdict.Uncovered,
+			Partial: !report.Verdict.Complete,
+		}
 	}
 	pkgConfig.Dependencies = updatedDeps
 
@@ -131,11 +171,90 @@ func (b *Builder) BuildOffline(ctx context.Context, gitURL, tag, outputPath stri
 	})
 }
 
-func (b *Builder) buildDependencies(ctx context.Context, deps []dist.ImageOrURI, depsDir string) ([]dist.ImageOrURI, error) {
+// cachedBuildpackTOML recovers a cached component's buildpack.toml.
+//
+// The copy stored beside the archive is the original and is preferred. Falling
+// back to the archive keeps caches written before metadata was recorded
+// working: coverage resolves either way, since jam preserves the stacks field,
+// and only provenance is lost.
+func (b *Builder) cachedBuildpackTOML(cacheKey, packedPath string) (preflight.BuildpackTOML, error) {
+	if raw, ok := b.cache.GetMeta(cacheKey); ok {
+		return preflight.Parse(raw, cacheKey)
+	}
+	b.log.Debugf("no cached buildpack.toml for %s; reading the archive, which cannot report provenance", cacheKey)
+	return preflight.ParseArchive(packedPath)
+}
+
+// checkCoverage evaluates one component and decides whether to stop now.
+//
+// Failing fast is only sound when every order group needs this component:
+// its absence then makes the whole tag unbuildable. A component required by
+// some groups but not others cannot be judged alone, since another group may
+// still be satisfiable, so it is recorded and left to the final verdict.
+func (b *Builder) checkCoverage(bp preflight.BuildpackTOML, groups []preflight.Group, report *preflight.Component) error {
+	c := preflight.Evaluate(bp, groups, b.stack, b.target.Arch)
+
+	// Recorded before any error return, or the component that failed would be
+	// missing from the report that exists to explain the failure.
+	*report = c
+
+	if b.stack == "" || c.Covered {
+		return nil
+	}
+	if !preflight.UnconditionallyRequired(groups, c.ID) {
+		b.log.Warnf("%s declares no dependency built for %s on %s; another order group may still satisfy the build",
+			c.ID, b.target, b.stack)
+		return nil
+	}
+	return &preflight.CoverageError{
+		Stack:   b.stack,
+		Target:  b.target.String(),
+		Missing: []string{c.ID},
+	}
+}
+
+// report assembles the sidecar from whatever was evaluated.
+func (b *Builder) report(gitURL, tag string, groups []preflight.Group, components []preflight.Component) preflight.Report {
+	preflight.Sort(components, repoName(gitURL))
+	return preflight.NewReport(preflight.Identity{
+		GitURL: gitURL,
+		Tag:    tag,
+		Target: b.target.String(),
+		Stack:  b.stack,
+	}, groups, components)
+}
+
+// repoName is the last path segment of a Git URL, used to guess which
+// component carries the language runtime so it sorts first in the report.
+func repoName(gitURL string) string {
+	trimmed := strings.TrimSuffix(strings.TrimRight(gitURL, "/"), ".git")
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 {
+		return trimmed[i+1:]
+	}
+	return trimmed
+}
+
+// buildDependencies vendors every component, gating each one on stack coverage
+// before it is vendored.
+//
+// Results are collected into a slice indexed by component, so each goroutine
+// owns its slot and no lock is needed. A slot left zero is one that was never
+// evaluated -- which is not the same as one that passed, and the report keeps
+// them distinct.
+//
+// The components slice is returned alongside any error rather than discarded
+// with it, since a cancelled run still holds most of the diagnosis.
+func (b *Builder) buildDependencies(
+	ctx context.Context,
+	deps []dist.ImageOrURI,
+	depsDir string,
+	groups []preflight.Group,
+) ([]dist.ImageOrURI, []preflight.Component, error) {
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(b.concurrency)
 
 	updated := make([]dist.ImageOrURI, len(deps))
+	components := make([]preflight.Component, len(deps))
 
 	for i, dep := range deps {
 		i, dep := i, dep
@@ -143,7 +262,7 @@ func (b *Builder) buildDependencies(ctx context.Context, deps []dist.ImageOrURI,
 			localFileName := fmt.Sprintf("dep-%d.tgz", i)
 			localFilePath := filepath.Join(depsDir, localFileName)
 
-			if err := b.buildDependency(ctx, dep, localFilePath); err != nil {
+			if err := b.buildDependency(ctx, dep, localFilePath, groups, &components[i]); err != nil {
 				return err
 			}
 
@@ -155,12 +274,18 @@ func (b *Builder) buildDependencies(ctx context.Context, deps []dist.ImageOrURI,
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, components, err
 	}
-	return updated, nil
+	return updated, components, nil
 }
 
-func (b *Builder) buildDependency(ctx context.Context, dep dist.ImageOrURI, localFilePath string) error {
+func (b *Builder) buildDependency(
+	ctx context.Context,
+	dep dist.ImageOrURI,
+	localFilePath string,
+	groups []preflight.Group,
+	report *preflight.Component,
+) error {
 	imageURI := dep.URI
 	if imageURI == "" {
 		imageURI = dep.ImageName
@@ -194,6 +319,19 @@ func (b *Builder) buildDependency(ctx context.Context, dep dist.ImageOrURI, loca
 	packedPath, found := b.cache.Get(cacheKey)
 	if found {
 		b.log.Infof("Using cached archive for %s", cacheKey)
+
+		// On a cache hit the component is never cloned, so buildpack.toml has
+		// to come from the cache. The copy stored beside the archive is the
+		// original; the one inside the archive has been through jam, which
+		// rewrites every dependency uri and drops source, leaving no way to
+		// tell a prebuilt binary from a source tarball.
+		bp, err := b.cachedBuildpackTOML(cacheKey, packedPath)
+		if err != nil {
+			return err
+		}
+		if err := b.checkCoverage(bp, groups, report); err != nil {
+			return err
+		}
 	} else {
 		b.log.Infof("Building offline package for %s...", cacheKey)
 		compDir, err := os.MkdirTemp("", "comp-bp-*")
@@ -208,6 +346,18 @@ func (b *Builder) buildDependency(ctx context.Context, dep dist.ImageOrURI, loca
 			return fmt.Errorf("failed to clone component repo %s: %w", repoURL, err)
 		}
 
+		// The gate sits here, between the clone and the vendoring: jam is the
+		// expensive step, downloading every dependency the buildpack declares,
+		// and this is the last moment before it starts. The raw bytes are kept
+		// because this is also the last moment at which provenance exists.
+		bp, raw, err := preflight.ReadDir(compDir)
+		if err != nil {
+			return err
+		}
+		if err := b.checkCoverage(bp, groups, report); err != nil {
+			return err
+		}
+
 		packedPath = filepath.Join(compDir, packedArchiveName)
 		if err := b.jamPacker.PackOffline(ctx, compDir, parsed.Tag, packedPath); err != nil {
 			return fmt.Errorf("failed jam pack for %s: %w", repoURL, err)
@@ -215,6 +365,10 @@ func (b *Builder) buildDependency(ctx context.Context, dep dist.ImageOrURI, loca
 
 		if err := b.cache.Put(cacheKey, packedPath); err != nil {
 			b.log.Warnf("could not cache %s: %v", cacheKey, err)
+		} else if err := b.cache.PutMeta(cacheKey, raw); err != nil {
+			// Losing the metadata costs a later run its provenance, not its
+			// correctness: coverage still resolves from the archive.
+			b.log.Warnf("could not cache buildpack.toml for %s: %v", cacheKey, err)
 		}
 	}
 

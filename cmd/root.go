@@ -12,6 +12,7 @@ import (
 	"github.com/adoramshoval/albs/pkg/git"
 	"github.com/adoramshoval/albs/pkg/multiarch"
 	"github.com/adoramshoval/albs/pkg/packer"
+	"github.com/adoramshoval/albs/pkg/preflight"
 	"github.com/adoramshoval/albs/pkg/resolver"
 	packlogging "github.com/buildpacks/pack/pkg/logging"
 	"github.com/spf13/cobra"
@@ -24,6 +25,7 @@ var (
 	cacheDir    string
 	repoMapPath string
 	targetSpec  string
+	stackSpec   string
 	concurrency int
 	verbose     bool
 )
@@ -48,6 +50,13 @@ func run(ctx context.Context) error {
 	log := newLogger()
 
 	target, err := multiarch.ParseTarget(targetSpec)
+	if err != nil {
+		return err
+	}
+
+	// Normalised up front so that a mistyped stack fails as an unknown stack
+	// here, rather than as a tag with no coverage an hour into the build.
+	stack, err := preflight.NormalizeStack(stackSpec)
 	if err != nil {
 		return err
 	}
@@ -89,6 +98,7 @@ func run(ctx context.Context) error {
 		log,
 		concurrency,
 		target,
+		stack,
 	)
 
 	return b.BuildOffline(ctx, gitURL, tag, outputPath)
@@ -114,6 +124,7 @@ func init() {
 	rootCmd.Flags().StringVar(&cacheDir, "cache-dir", "./.cache", "Local directory path for caching component archives")
 	rootCmd.Flags().StringVar(&repoMapPath, "repo-map", "", "Path to JSON/YAML file mapping image URIs to Git URLs (e.g. repo-map.json or repo-map.yaml)")
 	rootCmd.Flags().StringVar(&targetSpec, "target", "linux/amd64", "Platform (<os>/<arch>) to package for; component buildpacks ship binaries for several, and only one can sit at the buildpack root")
+	rootCmd.Flags().StringVar(&stackSpec, "stack", "", "Stack to assert dependency coverage against, as a full id (io.buildpacks.stacks.jammy) or a bare name (jammy); reports without failing when unset")
 	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "j", runtime.NumCPU(), "Maximum concurrent component builds")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
 

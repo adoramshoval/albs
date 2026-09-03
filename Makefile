@@ -54,6 +54,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -rf .cache
 	@rm -f *.cnb
+	@rm -f *.versions.json
 
 ## help: Displays available Makefile target descriptions
 help:
