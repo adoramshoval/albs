@@ -127,7 +127,7 @@ func BenchmarkCompressionLevel(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if err := rewrite(src, dst, target, lay, lvl.level); err != nil {
+				if _, err := rewrite(src, dst, target, lay, lvl.level); err != nil {
 					b.Fatalf("rewrite: %v", err)
 				}
 			}
