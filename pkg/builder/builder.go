@@ -373,8 +373,17 @@ func (b *Builder) buildDependency(
 	}
 
 	b.log.Debugf("Flattening %s to %s", cacheKey, b.target)
-	if err := multiarch.Flatten(packedPath, localFilePath, b.target); err != nil {
+	collapsed, err := multiarch.Flatten(packedPath, localFilePath, b.target)
+	if err != nil {
 		return fmt.Errorf("preparing %s for %s: %w", cacheKey, b.target, err)
+	}
+	// Warned rather than failed: the collapse is what any extractor would have
+	// done, and the bundle is correct without it. It is reported because the
+	// archive now differs from what jam produced, and because a layer carrying
+	// one path twice is refused only much later, by the container runtime
+	// unpacking the built image on a node.
+	for _, name := range collapsed {
+		b.log.Warnf("%s: %s appeared more than once; kept the last copy", cacheKey, name)
 	}
 	return nil
 }

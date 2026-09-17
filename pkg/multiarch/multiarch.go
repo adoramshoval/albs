@@ -11,6 +11,12 @@
 // [[dependencies]]: those are read verbatim by buildpack.FromBuildpackRootBlob.
 // An unflattened component therefore packages without complaint and fails at
 // build time with "fork/exec .../bin/detect: no such file or directory".
+//
+// Flattening also collapses entries that resolve to the same path. Ordinary
+// extraction is last-write-wins and hides a duplicate, so one survives
+// packaging, the push and the registry; containers/storage records a layer's
+// structure with tar-split, which cleans every name and refuses a repeat, so
+// the archive only fails when a node finally unpacks the image built from it.
 package multiarch
 
 import (
@@ -74,24 +80,39 @@ func (t Target) prefix() string { return t.OS + "/" + t.Arch + "/" }
 // Archives that already carry bin/ at the root are passed through untouched --
 // hardlinked to dstPath where the filesystem allows, copied where it does not --
 // so this is safe to apply to every component regardless of how it was built.
-func Flatten(srcPath, dstPath string, target Target) error {
+//
+// It returns, sorted, every path that appeared more than once and so was
+// collapsed to its last copy. That is not an error -- the result is exactly
+// what an extractor would have left on disk -- but it means the archive
+// differs from its input, which is worth saying out loud.
+func Flatten(srcPath, dstPath string, target Target) ([]string, error) {
 	lay, err := scan(srcPath, target)
 	if err != nil {
-		return fmt.Errorf("inspecting %s: %w", srcPath, err)
+		return nil, fmt.Errorf("inspecting %s: %w", srcPath, err)
 	}
 
 	switch {
 	case len(lay.hoisted) > 0:
 		return rewrite(srcPath, dstPath, target, lay, compressionLevel)
 	case lay.hasRootBin || len(lay.platforms) == 0:
-		// Already flat: dst would be byte-identical to src, so link it rather
-		// than rewriting gigabytes to no effect. Both names are treated as
-		// immutable from here on -- pack only ever reads them.
-		return fsutil.LinkOrCopy(srcPath, dstPath)
+		// Already flat, so no entry needs renaming -- but an archive can still
+		// arrive carrying one path twice, and no runtime will unpack that.
+		// Rewriting is only worth gigabytes of I/O when it actually is: with
+		// nothing to collapse, dst would be byte-identical to src, so link it
+		// instead. Both names are treated as immutable from here on -- pack
+		// only ever reads them.
+		dup := collisions(lay.names, identity)
+		if len(dup) == 0 {
+			return nil, fsutil.LinkOrCopy(srcPath, dstPath)
+		}
+		if err := transform(srcPath, dstPath, compressionLevel, identity, dup); err != nil {
+			return nil, err
+		}
+		return collapsed(dup), nil
 	default:
 		// Refusing here matters: copying through would produce a .cnb that
 		// only fails much later, inside the detect phase of a real build.
-		return fmt.Errorf("archive ships no %s binaries, only %s",
+		return nil, fmt.Errorf("archive ships no %s binaries, only %s",
 			target, strings.Join(sortedKeys(lay.platforms), ", "))
 	}
 }
@@ -104,6 +125,12 @@ type layout struct {
 	platforms map[string]bool
 	// hoisted maps each of the target's files to the name it takes at the root.
 	hoisted map[string]bool
+	// names holds every entry name, in archive order, so that finding
+	// collisions costs no second pass. Re-walking would mean decompressing the
+	// whole archive again, which for an offline component runs to several
+	// gigabytes; the names are a few hundred kilobytes at most, since jam
+	// vendors dependencies as tarballs rather than as extracted trees.
+	names []string
 }
 
 func scan(srcPath string, target Target) (layout, error) {
@@ -111,6 +138,10 @@ func scan(srcPath string, target Target) (layout, error) {
 	prefix := target.prefix()
 
 	err := walk(srcPath, func(hdr *tar.Header) error {
+		// Appended before anything can skip the entry: an index into this
+		// slice has to mean the same position transform will count to.
+		lay.names = append(lay.names, hdr.Name)
+
 		name := normalize(hdr.Name)
 		if name == "" {
 			return nil
@@ -132,7 +163,7 @@ func scan(srcPath string, target Target) (layout, error) {
 	return lay, err
 }
 
-func rewrite(srcPath, dstPath string, target Target, lay layout, level int) error {
+func rewrite(srcPath, dstPath string, target Target, lay layout, level int) ([]string, error) {
 	prefix := target.prefix()
 
 	// Only the directories that exist to hold per-platform trees are dropped,
@@ -161,13 +192,64 @@ func rewrite(srcPath, dstPath string, target Target, lay layout, level int) erro
 		return name, !lay.hoisted[name]
 	}
 
-	return transform(srcPath, dstPath, level, rename)
+	dup := collisions(lay.names, rename)
+	if err := transform(srcPath, dstPath, level, rename, dup); err != nil {
+		return nil, err
+	}
+	return collapsed(dup), nil
+}
+
+// identity is the mapping used when nothing is being hoisted: names are
+// normalized, and the archive root, which needs no entry of its own, is
+// dropped.
+func identity(name string) (string, bool) {
+	name = normalize(name)
+	return name, name != ""
+}
+
+// collisions maps every output name that more than one entry resolves to onto
+// the index of that name's last entry.
+//
+// The last is the one kept. A tar writer cannot retract an entry it has
+// already streamed, so the choice has to be made before writing; keeping the
+// last is what extraction would have produced anyway, and it matters which way
+// round this goes. For a component buildpack the colliding path is
+// buildpack.toml, and the later copy is the one jam rewrote to point at the
+// vendored dependencies -- keeping the earlier one would leave a bundle that
+// packages cleanly and then reaches for the network at build time.
+func collisions(names []string, rename func(string) (string, bool)) map[string]int {
+	seen := make(map[string]int, len(names))
+	dup := map[string]int{}
+	for i, raw := range names {
+		name, keep := rename(raw)
+		if !keep {
+			continue
+		}
+		if _, repeat := seen[name]; repeat {
+			dup[name] = i
+		}
+		seen[name] = i
+	}
+	return dup
+}
+
+// collapsed lists the colliding names, sorted, for the caller to report.
+func collapsed(dup map[string]int) []string {
+	if len(dup) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(dup))
+	for name := range dup {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // transform streams src to dst, renaming or dropping entries as rename says.
 // It never holds an entry in memory: an offline component archive carries every
 // vendored dependency the buildpack declares and runs to several gigabytes.
-func transform(srcPath, dstPath string, level int, rename func(string) (string, bool)) (err error) {
+func transform(srcPath, dstPath string, level int, rename func(string) (string, bool), dup map[string]int) (err error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return err
@@ -205,7 +287,10 @@ func transform(srcPath, dstPath string, level int, rename func(string) (string, 
 	copyBuf := make([]byte, bufSize)
 
 	tr := tar.NewReader(gr)
-	for {
+	// idx counts every entry read, skipped ones included, so that it indexes
+	// the same positions scan recorded. continue runs the post statement, so
+	// dropping an entry does not desynchronise the count.
+	for idx := 0; ; idx++ {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -216,6 +301,10 @@ func transform(srcPath, dstPath string, level int, rename func(string) (string, 
 
 		name, keep := rename(hdr.Name)
 		if !keep {
+			continue
+		}
+		// Every occurrence of a colliding name is dropped but the last.
+		if last, collides := dup[name]; collides && last != idx {
 			continue
 		}
 

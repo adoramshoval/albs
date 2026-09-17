@@ -120,7 +120,7 @@ func flatten(t *testing.T, entries []entry, target Target) (map[string]entry, er
 	dst := filepath.Join(tmp, "dst.tgz")
 	writeArchive(t, src, entries)
 
-	if err := Flatten(src, dst, target); err != nil {
+	if _, err := Flatten(src, dst, target); err != nil {
 		return nil, err
 	}
 	return readArchive(t, dst), nil
@@ -165,7 +165,7 @@ func TestFlattenSelectsTheRequestedArch(t *testing.T) {
 	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
 	writeArchive(t, src, multiArchEntries())
 
-	if err := Flatten(src, dst, Target{OS: "linux", Arch: "arm64"}); err != nil {
+	if _, err := Flatten(src, dst, Target{OS: "linux", Arch: "arm64"}); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestFlattenPrefersTheHoistedCopyOnCollision(t *testing.T) {
 	tmp := t.TempDir()
 	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
 	writeArchive(t, src, entries)
-	if err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
+	if _, err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 
@@ -267,6 +267,89 @@ func TestFlattenPrefersTheHoistedCopyOnCollision(t *testing.T) {
 	}
 }
 
+// jam rewrites buildpack.toml to point at the vendored dependencies, and an
+// archive can reach us carrying both that copy and the original. Extraction
+// hides it -- the last entry wins -- but containers/storage records a layer
+// with tar-split, which cleans every name and refuses a repeat, so a duplicate
+// survives packaging, the push and the registry and only fails when a node
+// unpacks the image built from the bundle.
+func TestFlattenCollapsesDuplicatePaths(t *testing.T) {
+	entries := []entry{
+		file("buildpack.toml", "original"),
+		dir("linux/amd64"),
+		dir("linux/amd64/bin"),
+		file("linux/amd64/bin/run", "ELF"),
+		file("buildpack.toml", "rewritten"),
+	}
+
+	tmp := t.TempDir()
+	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
+	writeArchive(t, src, entries)
+
+	collapsed, err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatalf("Flatten: %v", err)
+	}
+
+	got := bodies(t, dst)
+	if len(got["buildpack.toml"]) != 1 {
+		t.Fatalf("buildpack.toml appears %d times, want 1", len(got["buildpack.toml"]))
+	}
+	// Which copy survives is the whole point: the later one is jam's rewrite,
+	// and keeping the earlier would leave a bundle that still wants the network.
+	if body := got["buildpack.toml"][0]; body != "rewritten" {
+		t.Errorf("buildpack.toml = %q, want the last copy", body)
+	}
+	if len(collapsed) != 1 || collapsed[0] != "buildpack.toml" {
+		t.Errorf("collapsed = %v, want [buildpack.toml]", collapsed)
+	}
+}
+
+// A flat archive is normally hardlinked rather than rewritten, which would
+// carry a duplicate straight through. "./x" and "x" are also the same path
+// once cleaned, so the collision is not visible as a string comparison.
+func TestFlattenCollapsesDuplicatePathsInAFlatArchive(t *testing.T) {
+	entries := []entry{
+		file("buildpack.toml", "original"),
+		dir("bin"),
+		file("bin/run", "ELF"),
+		file("./buildpack.toml", "rewritten"),
+	}
+
+	tmp := t.TempDir()
+	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
+	writeArchive(t, src, entries)
+
+	collapsed, err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatalf("Flatten: %v", err)
+	}
+	if len(collapsed) != 1 || collapsed[0] != "buildpack.toml" {
+		t.Errorf("collapsed = %v, want [buildpack.toml]", collapsed)
+	}
+
+	got := bodies(t, dst)
+	if len(got["buildpack.toml"]) != 1 {
+		t.Fatalf("buildpack.toml appears %d times, want 1", len(got["buildpack.toml"]))
+	}
+	if body := got["buildpack.toml"][0]; body != "rewritten" {
+		t.Errorf("buildpack.toml = %q, want the last copy", body)
+	}
+
+	// Linking here would defeat the collapse entirely.
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat src: %v", err)
+	}
+	dstInfo, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if os.SameFile(srcInfo, dstInfo) {
+		t.Error("an archive carrying a duplicate path was linked instead of rewritten")
+	}
+}
+
 func TestFlattenRejectsANonArchive(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.tgz")
@@ -274,7 +357,7 @@ func TestFlattenRejectsANonArchive(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := Flatten(src, filepath.Join(tmp, "dst.tgz"), Target{OS: "linux", Arch: "amd64"}); err == nil {
+	if _, err := Flatten(src, filepath.Join(tmp, "dst.tgz"), Target{OS: "linux", Arch: "amd64"}); err == nil {
 		t.Fatal("expected an error for a file that is not a gzipped tar")
 	}
 }
@@ -367,7 +450,7 @@ func TestFlattenLinksRatherThanCopyingAFlatArchive(t *testing.T) {
 	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
 	writeArchive(t, src, entries)
 
-	if err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
+	if _, err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 
@@ -390,7 +473,7 @@ func TestFlattenRewriteDoesNotAliasTheSource(t *testing.T) {
 	src, dst := filepath.Join(tmp, "src.tgz"), filepath.Join(tmp, "dst.tgz")
 	writeArchive(t, src, multiArchEntries())
 
-	if err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
+	if _, err := Flatten(src, dst, Target{OS: "linux", Arch: "amd64"}); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 
